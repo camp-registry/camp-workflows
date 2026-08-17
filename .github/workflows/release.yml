@@ -1,0 +1,153 @@
+# camp release — reusable workflow (workflow_call).
+#
+# Call this from your own workflow instead of copying the template; fixes
+# and camp-tools pin bumps then land here once instead of in every plugin
+# repository (the stale-copy problem the templates suffer from).
+#
+# Minimal caller, per plugin repository (.github/workflows/camp-release.yml):
+#
+#   name: Publish release to camp
+#   on:
+#     push:
+#       tags: ["v*"]
+#     workflow_dispatch: {}
+#   permissions:
+#     contents: read
+#     id-token: write     # OIDC identity for the camp publish service; the
+#                         # caller must grant it — a reusable workflow cannot
+#                         # escalate its own permissions.
+#   jobs:
+#     camp:
+#       uses: camp-registry/camp-workflows/.github/workflows/release.yml@v1
+#
+# Organizations with shared workflows: add the same `uses:` job to the shared
+# workflow all your plugins already call. The OIDC token always identifies the
+# plugin repository that triggered the run, not the workflow's home, so the
+# publish service's repository-id binding is unchanged.
+
+name: camp release
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: Frankenstyle override; empty reads $plugin->component
+        type: string
+        default: ""
+      supported-moodle:
+        description: Override, e.g. "4.1,4.4"; empty reads version.php
+        type: string
+        default: ""
+
+env:
+  CAMP_INDEX_REPO: camp-registry/camp-index
+  CAMP_PUBLISH_URL: https://publish.camp-registry.org/publish
+  COMPONENT: ${{ inputs.component }}
+  SUPPORTED_MOODLE: ${{ inputs.supported-moodle }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      # Releases are built at immutable tags only; the publish service
+      # additionally refuses branch-minted tokens, so this guard just
+      # fails earlier with a better message (camp-tools#15).
+      - name: Require a tag ref
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::error::This workflow must run at a tag. From workflow_dispatch, pick the tag in the ref dropdown. Current ref: ${{ github.ref_name }} (${{ github.ref_type }})"
+            exit 1
+          fi
+
+      - name: Check out plugin at the tag
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+          fetch-depth: 0
+
+      # Read-only: camp release computes your record against your entry's
+      # current ledger. Nothing is pushed from this job.
+      - name: Check out camp index
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CAMP_INDEX_REPO }}
+          path: index-repo
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install camp tools
+        run: pip install --quiet "git+https://github.com/camp-registry/camp-tools@v0.2.54"
+
+      - name: Resolve component name
+        run: |
+          if [ -z "${COMPONENT}" ]; then
+            COMPONENT=$(sed -nE 's/.*\$plugin->component[[:space:]]*=[[:space:]]*.?([a-z][a-z0-9_]*).?[[:space:]]*;.*/\1/p' plugin/version.php | head -1)
+          fi
+          if [ -z "${COMPONENT}" ]; then
+            echo "::error::component input is empty and \$plugin->component was not found in version.php — set one of them"
+            exit 1
+          fi
+          echo "COMPONENT=${COMPONENT}" >> "$GITHUB_ENV"
+          echo "component: ${COMPONENT}"
+
+      - name: Require a listing manifest
+        run: camp scaffold plugin --check
+
+      - name: Label heuristics + security lint (warn-only preview)
+        run: |
+          camp lint-labels plugin || true
+          camp audit plugin || true
+
+      - name: Compute and append the release record
+        run: |
+          plugintype="${COMPONENT%%_*}"
+          camp release "index-repo/plugins/${plugintype}/${COMPONENT}.yml" \
+            "${GITHUB_REF_NAME}" --source ./plugin \
+            ${SUPPORTED_MOODLE:+--supported-moodle "${SUPPORTED_MOODLE}"}
+
+      - name: Publish (OIDC token exchange)
+        run: |
+          CAMP_OIDC_TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=camp-publish" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["value"])')
+          export CAMP_OIDC_TOKEN TAG="${GITHUB_REF_NAME}"
+          python3 <<'EOF'
+          import json, os, sys, urllib.request, yaml
+
+          component = os.environ["COMPONENT"]
+          tag = os.environ["TAG"]
+          path = f"index-repo/plugins/{component.split('_')[0]}/{component}.yml"
+          with open(path) as f:
+              record = yaml.safe_load(f)["releases"][-1]
+          assert record["tag"] == tag, "computed record is not for this tag"
+
+          body = json.dumps({
+              "token": os.environ["CAMP_OIDC_TOKEN"],
+              "component": component, "tag": tag, "record": record,
+          }).encode()
+          req = urllib.request.Request(
+              os.environ["CAMP_PUBLISH_URL"], data=body,
+              headers={"Content-Type": "application/json",
+                       "User-Agent": f"camp-release ({component})"})
+          try:
+              out = json.load(urllib.request.urlopen(req))
+          except urllib.error.HTTPError as e:
+              raw = e.read().decode(errors="replace")
+              try:
+                  out = json.loads(raw)
+                  msg = f"({out.get('code')}): {out.get('message')}"
+              except ValueError:
+                  msg = f"HTTP {e.code}: {raw[:200]}"
+              print(f"::error::camp publish refused {msg}")
+              sys.exit(1)
+          print("Release PR:", out["pr"])
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as f:
+                  f.write(f"Release PR: {out['pr']}\n\n"
+                          "camp CI will independently rebuild the artifact "
+                          "from the tag and verify the recorded hashes "
+                          "before this can merge.\n")
+          EOF
