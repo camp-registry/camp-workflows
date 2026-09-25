@@ -23,6 +23,10 @@ jobs:
     uses: camp-registry/camp-workflows/.github/workflows/release.yml@v1
 ```
 
+The same file, ready to copy or fetch, is served at
+`https://camp-registry.org/templates/camp-release.yml` (canonical source:
+[camp-index `templates/camp-release.yml`](https://github.com/camp-registry/camp-index/blob/main/templates/camp-release.yml)).
+
 Publishing a release is then `git tag v1.2.3 && git push --tags`. No
 token, no secrets, no fork: the workflow proves its identity to the camp
 publish service with a signed OIDC token, and authorization is your
