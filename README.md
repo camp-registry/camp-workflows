@@ -40,3 +40,14 @@ the run, so per-plugin authorization is unchanged.
 
 `@v1` follows the latest v1.x.y release; exact tags exist if you prefer
 pinning. The copy-paste templates in camp-index remain supported.
+
+## Changing the calling convention
+
+If `release.yml` ever gains a required input or secret, needs another
+permission, or moves off the `v1` tag, three copies of the caller must
+change together: camp-index `templates/camp-release.yml` (the file plugin
+repositories and scaffolding tools fetch), the block in this README, and
+the block in camp-docs AUTHORS.md. camp-index's publish workflow checks
+all three against `release.yml` twice a day and goes red on drift
+(`.github/scripts/check-caller-template.py`), so a forgotten copy is
+noticed within hours, not when an author's release fails.
